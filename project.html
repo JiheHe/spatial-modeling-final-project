@@ -21,11 +21,289 @@
 <body>
 <script type="module">
     import {ThreeEngine} from "./js/utils/utils_three.js";
+    import {B1Z1Robot, XArm7Robot} from "./js/utils/utils_robot.js";
+    import {get_default_lil_gui, refresh_displays} from "./js/utils/utils_three.js";
+    import {identity_matrix, mul_matrix_matrix, frobenius_norm_matrix, mul_matrix_scalar,
+        add_matrix_matrix, normalized_matrix} from "./js/utils/utils_math.js";
+
+    let epsilon = 0.0001
+    function exponential_map_so3(m) {
+        let u = [m[2][1], m[0][2], m[1][0]]
+        let beta = frobenius_norm_matrix(u);
+        let p, q;
+        if (beta < epsilon) {
+            p = 1 - ((beta**2)/6) + ((beta**4)/120);
+            q = 1/2 - ((beta**2)/24) + ((beta**4)/720);
+        }
+        else {
+            p = Math.sin(beta) / beta;
+            q = (1 - Math.cos(beta)) / (beta**2);
+        }
+        let exp = add_matrix_matrix(add_matrix_matrix(identity_matrix(3), mul_matrix_scalar(m, p)),
+            mul_matrix_scalar(mul_matrix_matrix(m, m), q));
+        return exp;  // in SO(3)
+    }
+
+    function draw_euler_axis(pose, length, width) {
+        // Modified from utils_euler_angles's draw intermediate vector
+        let x = [[length], [0], [0], [1]];
+        let y = [[0], [length], [0], [1]];
+        let z = [[0], [0], [length], [1]];
+
+        // Maps to same rotation and translation as pose
+        let mapped_x = mul_matrix_matrix(pose, x).slice(0, 3);
+        let mapped_y = mul_matrix_matrix(pose, y).slice(0, 3);
+        let mapped_z = mul_matrix_matrix(pose, z).slice(0, 3);
+
+        // Extract the positions
+        let position = [ [pose[0][3]],
+            [pose[1][3]],
+            [pose[2][3]] ];
+
+        engine.draw_debug_line(position, mapped_x, true, width, 0xff2222);
+        engine.draw_debug_line(position, mapped_y, true, width, 0x22ff22);
+        engine.draw_debug_line(position, mapped_z, true, width, 0x2222ff);
+    }
+
+    function forward_kinematics(states) {  // states are stored in settings
+        // Use forward kinematics to compute the output SE(3) poses from the given set of states
+        // 1) Initialize an ordered set of identity elements for all links
+        let output_poses = [];
+        let identity_elem_SE3 = identity_matrix(4);
+        for(let i = 0; i < links.length; i++) {
+            output_poses.push(identity_elem_SE3);
+        }
+        // 2) Iterate through the kinematic hierarchy, calculating the new pose at each link with
+        // respect to the parent joint and parent link, conditioned on the joint type, etc
+        kh.forEach(layer => {  // for each layer of the hierarchy (assume layer n-1 is done at layer n)
+            layer.forEach(link_idx => {  // for each link in the current layer
+                let curr_link = links[link_idx];
+                let parent_link_idx = curr_link.parent_link_idx;
+                let parent_joint_idx = curr_link.parent_joint_idx;
+                let curr_joint = joints[parent_joint_idx];  // Note Ji,j such that i is parent, j is child
+                if (curr_joint) {  // world has no parent joint
+                    let joint_type = curr_joint.joint_type_string;
+
+                    let curr_pose = output_poses[parent_link_idx];  // T_i
+                    let T_c = curr_joint.xyz_rpy_SE3_matrix;  // T_c
+                    curr_pose = mul_matrix_matrix(curr_pose, T_c);  // T_i transformed by T_c via group operator of MATMUL for SE(3)
+
+                    // T_v will depend on some values in the state
+                    let T_v;
+                    if (joint_type === 'revolute') {
+                        // Grab dof value
+                        let theta1 = states[curr_joint.dof_idx];
+                        // Grab the local rotation axis (need to be w.r.t to preceding links)
+                        let normalized_u = normalized_matrix(curr_joint.axis);
+                        // Construct T_v
+                        // #1 construct the SO(3) matrix
+                        let r = [ [0, -normalized_u[2], normalized_u[1]],
+                            [normalized_u[2], 0, -normalized_u[0]],
+                            [-normalized_u[1], normalized_u[0], 0] ];
+                        T_v = exponential_map_so3(mul_matrix_scalar(r, theta1))
+                        // #2 construct the tv
+                        T_v[0].push(0);
+                        T_v[1].push(0);
+                        T_v[2].push(0);
+                        T_v.push([0, 0, 0, 1]);
+                    }
+                    else if (joint_type === 'prismatic') {
+                        // Grab dof value
+                        let theta1 = states[curr_joint.dof_idx];
+                        // Grab the local transformation axis (need to be w.r.t to preceding links)
+                        let normalized_u = normalized_matrix(curr_joint.axis);
+                        // Construct T_v
+                        // #1 construct the scaled translation
+                        let scaled_t = mul_matrix_scalar(normalized_u, theta1);
+                        // #2 construct the tv
+                        T_v = identity_matrix(4);
+                        T_v[0][3] = scaled_t[0][0];
+                        T_v[1][3] = scaled_t[1][0];
+                        T_v[2][3] = scaled_t[2][0];
+                    }
+                    else if (joint_type === 'floating') {
+                        // Grab dof value
+                        let rd = curr_joint.rotation_dof_idxs;
+                        let td = curr_joint.translation_dof_idxs;
+                        let theta1 = states[rd[0]];
+                        let theta2 = states[rd[1]];
+                        let theta3 = states[rd[2]];
+                        let theta4 = states[td[0]];
+                        let theta5 = states[td[1]];
+                        let theta6 = states[td[2]];
+                        // Construct T_v
+                        // #1 construct SO(3)
+                        let r = [ [0, -theta3, theta2],
+                            [theta3, 0, -theta1],
+                            [-theta2, theta1, 0] ];
+                        T_v = exponential_map_so3(r);
+                        // #2 construct the tv
+                        T_v[0].push(theta4);
+                        T_v[1].push(theta5);
+                        T_v[2].push(theta6);
+                        T_v.push([0, 0, 0, 1]);
+                    }
+                    else if (joint_type === 'fixed') {
+                        // Do nothing.
+                        T_v = identity_matrix(4);
+                    } // etc
+                    // Don't think there are more joint types included.
+
+                    // T_iT_c transformed by T_v via group operator of MATMUL for SE(3)
+                    curr_pose = mul_matrix_matrix(curr_pose, T_v);
+                    output_poses[link_idx] = curr_pose;  // stores T_j
+                }
+            });
+        });
+
+        return output_poses;
+    }
 
     let engine = ThreeEngine.new_default_3d();
 
-    engine.animation_loop( ()  => {
+    let robot = new B1Z1Robot();
 
+    // Grab the FK infos of the robot
+    let links = robot.links;
+    let joints = robot.joints;
+    let kh = robot.kinematic_hierarchy;
+
+    // Set up the GUI
+    let settings = {
+        display_mesh: true,
+        display_wireframe: false,
+        display_mesh_only_with_frame: false,  // display selected links only
+        // Joint format: "dof"+joint.dof_idx
+        // Link format: "link"+link.link_idx
+    }
+    let link_to_name = new Array(links.length).fill(null);  // indexed by link_idx
+    for (let i in links) {  // frame select
+        let link = links[i];
+        let link_idx = link.link_idx;
+        settings["link"+link_idx] = false;
+        // Cache the data
+        link_to_name[link_idx] = link.link_name;
+    }
+    let dof_to_range = {};  // maps dof idx to its range of values
+    for (let i in joints) {  // dof values
+        let joint = joints[i];
+        if (joint.joint_type_string === "revolute" ||
+            joint.joint_type_string === "prismatic") {
+            settings["dof"+joint.dof_idx] = 0;
+            // Cache the data
+            dof_to_range[joint.dof_idx] = [joint.lower_bound, joint.upper_bound];
+        }
+        else if (joint.joint_type_string === "floating") {
+            for (let i = 0; i < joint.joint_num_dofs/2; i++) {  // 2 at a time
+                settings["dof"+joint.rotation_dof_idxs[i]] = 0;
+                // Cache the data
+                dof_to_range[joint.rotation_dof_idxs[i]] = [-Math.PI, Math.PI]; // default for free rotate
+
+                settings["dof"+joint.translation_dof_idxs[i]] = 0;
+                // Cache the data
+                dof_to_range[joint.translation_dof_idxs[i]] = [-1, 1]; // default for free translate
+            }
+        }
+        else if (joint.joint_type_string !== "fixed") {
+            throw new Error("More than 4 prescribed types of joints!");
+        }
+    }
+    let num_dofs = Object.keys(dof_to_range).length
+
+    let actions = {
+        reset: function() {  // resets dofs only
+            for (let key in settings) {
+                if (key.includes("dof")) {
+                    settings[key] = 0;
+                }
+            }
+            refresh_displays(gui);
+        },
+        select_all_frames: function() {  // selects all links
+            for (let key in settings) {
+                if (key.includes("link")) {
+                    settings[key] = true;
+                }
+            }
+            refresh_displays(gui);
+        },
+        deselect_all_frames: function() {  // deselect all links
+            for (let key in settings) {
+                if (key.includes("link")) {
+                    settings[key] = false;
+                }
+            }
+            refresh_displays(gui);
+        }
+    };
+
+    // Visualize GUI with needed joint info
+    let gui = get_default_lil_gui();
+    gui.add(settings, "display_mesh").name("Display Mesh");
+    gui.add(settings, "display_wireframe").name("Display Wireframe");
+    gui.add(settings, "display_mesh_only_with_frame").name("Display Mesh only with Frame");
+    // DOF folder
+    let dof_folder = gui.addFolder('DOFs');
+    const sortedKeys = Object.keys(dof_to_range).sort((a, b) => a - b); // Sort the dict based on dofs
+    for (const dof_idx of sortedKeys) {  // 'of' is foreach, 'in' is indexing
+        // Add based on range of values for the DoF
+        let range = dof_to_range[dof_idx];
+        dof_folder.add(settings, "dof"+dof_idx, range[0], range[1]).name("dof"+dof_idx);
+    }
+    // action folder
+    let action_folder = gui.addFolder("Actions");
+    action_folder.add(actions, "reset").name("Reset");
+    action_folder.add(actions, "select_all_frames").name("Select All Frames");
+    action_folder.add(actions, "deselect_all_frames").name("Deselect All Frames");
+    // link folder
+    let link_folder = gui.addFolder("Links");
+    for (let link_idx in link_to_name) {
+        let link_name = link_to_name[link_idx];
+        link_folder.add(settings, "link"+link_idx).name("link "+link_idx+": "+link_name);
+    }
+
+    // this will spawn all of the robot's links at the origin
+    robot.spawn_robot(engine);
+
+    engine.animation_loop( ()  => {
+        // Grab states from settings
+        let states = new Array(num_dofs).fill(null)
+        for (let key in settings) {
+            if (key.includes("dof")) {
+                // Grab the dof index and values
+                let dof_idx = key.match(/\d+/);
+                dof_idx = dof_idx ? parseInt(dof_idx[0]) : null;
+                states[dof_idx] = settings[key];
+            }
+        }
+
+        // Run forward kinematics
+        let output_poses = forward_kinematics(states);
+
+        // Apply the updated poses onto each link
+        for (let link_idx in output_poses) {
+            let output_pose = output_poses[link_idx];
+            robot.set_link_mesh_pose_from_SE3_matrix(engine, link_idx, output_pose);
+
+            // Draw gizmo on selected links
+            if (settings["link"+link_idx]) {
+                draw_euler_axis(output_pose, 0.05, 0.002);  // length and width of line segments
+            }
+        }
+
+        // Visibility settings
+        robot.set_wireframe_visibility(engine, settings.display_wireframe);
+        robot.set_mesh_visibility(engine, settings.display_mesh);
+        if (settings.display_mesh_only_with_frame) {
+            for (let link_idx = 0; link_idx < links.length; link_idx++) {
+                if (settings.display_wireframe) {
+                    robot.set_link_wireframe_visibility(engine, link_idx, settings["link"+link_idx]);
+                }
+                if (settings.display_mesh) {
+                    robot.set_link_mesh_visibility(engine, link_idx, settings["link"+link_idx]);
+                }
+            }
+        }
     });
 
 </script>
