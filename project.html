@@ -24,7 +24,10 @@
     import {B1Z1Robot, XArm7Robot} from "./js/utils/utils_robot.js";
     import {get_default_lil_gui, refresh_displays} from "./js/utils/utils_three.js";
     import {identity_matrix, mul_matrix_matrix, frobenius_norm_matrix, mul_matrix_scalar,
-        add_matrix_matrix, normalized_matrix} from "./js/utils/utils_math.js";
+        add_matrix_matrix, normalized_matrix, sub_matrix_matrix, dot_product,
+        matrix_inverse_3x3, transpose} from "./js/utils/utils_math.js";
+    import {optimization_solve} from "./js/utils/utils_optimization.js";
+    import {TransformGizmoEngine} from "./js/utils/utils_transform_gizmo.js"
 
     let epsilon = 0.0001
     function exponential_map_so3(m) {
@@ -42,6 +45,83 @@
         let exp = add_matrix_matrix(add_matrix_matrix(identity_matrix(3), mul_matrix_scalar(m, p)),
             mul_matrix_scalar(mul_matrix_matrix(m, m), q));
         return exp;  // in SO(3)
+    }
+
+    function disp_based_distance_SE3(m_1, m_2) {
+        // Calculate disp-based dist.
+        // Step 1: find disp(m1, m2) = m1^-1 MATMUL m2.
+        // Construct m1_inverse first.
+        // 1) Extract R (the m1_SO(3) matrix) from m1_SE(3) and transpose it
+        let R = [ m_1[0].slice(0, 3), m_1[1].slice(0, 3), m_1[2].slice(0, 3) ];
+        let R_T = transpose(R);
+        // 2) computed the inverse of translation vector via -R.T matmul t.
+        let t = [ [m_1[0][3]], [m_1[1][3]], [m_1[2][3]] ];  // t
+        let t_inv = mul_matrix_matrix(R_T, mul_matrix_scalar(t, -1));
+        // 3) compose the m1_inv (composed of R_T and t_inv) and get disp
+        let m1_inverse = [ [R_T[0][0], R_T[0][1], R_T[0][2], t_inv[0][0]],
+            [R_T[1][0], R_T[1][1], R_T[1][2], t_inv[1][0]],
+            [R_T[2][0], R_T[2][1], R_T[2][2], t_inv[2][0]],
+            [0, 0, 0, 1] ];
+        let disp = mul_matrix_matrix(m1_inverse, m_2);  // a 4x4 matrix in SE(3).
+
+        // Step 2: take the ln of disp(m1, m2). Log-mapping for SE(3) (from pset answer)
+        // 1) Extract R in disp_SO(3) from disp_SE(3)
+        R = [ disp[0].slice(0, 3), disp[1].slice(0, 3), disp[2].slice(0, 3) ];
+        R_T = transpose(R);
+        // 2) Obtain A = ln(R_disp)
+        let epsilon = 0.0001;  // the threshold
+        let tr_R = R[0][0] + R[1][1] + R[2][2];
+        let beta = Math.acos((tr_R - 1) / 2);
+        let A;
+        if (Math.abs(beta) < epsilon) {
+            A = mul_matrix_scalar(sub_matrix_matrix(R, R_T), (1/2 + (beta**2)/12 + 7*(beta**4)/720));
+        }
+        else if (Math.abs(beta - Math.PI) < epsilon) {
+            let c = Math.PI * Math.sqrt((1/2) * (R[2][2] + 1));  // a3
+            let b = Math.PI * Math.sqrt((1/2) * (R[1][1] + 1));  // a2
+            let a = Math.PI * Math.sqrt((1/2) * (R[0][0] + 1));  // a1
+            A = [ [0, -c, b],
+                [c, 0, -a],
+                [-b, a, 0] ];
+        }
+        else {
+            A = mul_matrix_scalar(sub_matrix_matrix(R, R_T), beta/(2*Math.sin(beta)));
+        }
+        // 3) Map from t_disp in Lie group to translation in Lie algebra.
+        let a1 = A[2][1];
+        let a2 = A[0][2];
+        let a3 = A[1][0];
+        let u = [a1, a2, a3];
+        beta = frobenius_norm_matrix(u);
+        let p_prime, q_prime;
+        if (beta < epsilon) {
+            p_prime = 1/2 - (beta**2)/24 + (beta**4)/720;
+            q_prime = 1/6 - (beta**2)/120
+        }
+        else {
+            p_prime = (1 - Math.cos(beta)) / (beta**2);
+            q_prime = (beta - Math.sin(beta)) / (beta**3);
+        }
+        // Construct the M matrix (in pset)
+        let M = add_matrix_matrix(add_matrix_matrix(identity_matrix(3), mul_matrix_scalar(A, p_prime)),
+            mul_matrix_scalar(mul_matrix_matrix(A, A), q_prime));
+        t = [ [disp[0][3]], [disp[1][3]], [disp[2][3]] ];  // t_disp
+        let b = mul_matrix_matrix(matrix_inverse_3x3(M), t)
+        // // 4) Compose the ln of disp lie algebra matrix.
+        // let ln_disp = [ [A[0][0], A[0][1], A[0][2], b[0][0]],
+        //     [A[1][0], A[1][1], A[1][2], b[1][0]],
+        //     [A[2][0], A[2][1], A[2][2], b[2][0]],
+        //     [0, 0, 0, 0] ];
+
+        // Step 3: Map ln_disp to its corresponding Euclidean space via distinct values
+        let a4 = b[0][0];
+        let a5 = b[1][0];
+        let a6 = b[2][0];
+        let I = [[a1], [a2], [a3], [a4], [a5], [a6]];  // apply the vee operation
+
+        // Step 4: Calculate the L-2 norm of the vector I. Done!
+        let dist = frobenius_norm_matrix(I);
+        return dist;
     }
 
     function draw_euler_axis(pose, length, width) {
@@ -159,6 +239,60 @@
         return output_poses;
     }
 
+    // Helpers for IK
+    function proj_scalar(v, u) {
+        return dot_product(v, u) / dot_product(u, u);
+    }
+    function proj_clamped(v, u) {
+        return mul_matrix_scalar(u, Math.min(Math.max(proj_scalar(v, u), 0), 1));
+    }
+    function proj_onto_line_segment(a, b, p) {
+        return add_matrix_matrix(proj_clamped(sub_matrix_matrix(p, a), sub_matrix_matrix(b, a)), a)
+    }
+
+    // States: an array where idx is dof_idx and value is value at that dof.
+    function inverse_kinematics(states, constants) {
+        // Process the constants
+        let ball_gizmo_SE3 = constants[0];
+        let trunk_gizmo_SE3 = constants[1];
+        let gripper_init = [[1], [0], [0]];
+
+        // Define an objective function
+        let f = states => {
+            // Run forward kinematics on the states to obtain output poses
+            let output_poses = forward_kinematics(states);
+
+            // Extract the needed info from output poses to construct constraint losses
+            let trunk_SE3 = output_poses[1];  // Link 1
+            let L1 = disp_based_distance_SE3(trunk_SE3, trunk_gizmo_SE3);
+
+            // let gripper_SE3 = output_poses[39];  // hard-coded for Link 30: gripper stater.
+            // let gripper_t3 = [gripper_SE3[0][3], gripper_SE3[1][3], gripper_SE3[2][3]];
+            // let gripper_SO3 = [gripper_SE3[0].slice(0,3), gripper_SE3[1].slice(0,3), gripper_SE3[2].slice(0,3)];
+            // let gripper_direction_vec = mul_matrix_matrix(gripper_SO3, gripper_init);
+            // let view_vector_end = add_matrix_matrix(gripper_t3, mul_matrix_scalar(gripper_direction_vec, 100));
+            // let ball_gizmo_t3 = [ball_gizmo_SE3[0][3], ball_gizmo_SE3[1][3], ball_gizmo_SE3[2][3]];
+            // let L2 = frobenius_norm_matrix(sub_matrix_matrix(
+            //     proj_onto_line_segment(gripper_t3, view_vector_end, ball_gizmo_t3), ball_gizmo_t3));
+            let L2 = 0;
+
+            return L1 + L2;  // return sum of losses
+        }
+        // Obtain a list of argmins (i.e. new dof values to achieve this IK)
+        let initial_values = states;  // dof values
+        let num_iterations = undefined;  // defaults to 100
+        let new_states = optimization_solve(f, initial_values, num_iterations, 'bfgs');
+        // Update setting's DOFs based on these new values
+        for (let dof_idx in new_states) {
+            settings["dof"+dof_idx] = new_states[dof_idx];
+            refresh_displays(gui);
+        }
+        // Run FK based these new dof values from IK
+        let new_output_poses = forward_kinematics(new_states);
+        // Return the new output poses
+        return new_output_poses;
+    }
+
     let engine = ThreeEngine.new_default_3d();
 
     let robot = new B1Z1Robot();
@@ -211,6 +345,35 @@
     let num_dofs = Object.keys(dof_to_range).length
 
     let actions = {
+        solve_IK: function() {
+            // Grab states from settings
+            let states = new Array(num_dofs).fill(null)
+            for (let key in settings) {
+                if (key.includes("dof")) {
+                    // Grab the dof index and values
+                    let dof_idx = key.match(/\d+/);
+                    dof_idx = dof_idx ? parseInt(dof_idx[0]) : null;
+                    states[dof_idx] = settings[key];
+                }
+            }
+
+            // Grab constant values from constraints
+            let constants = [gizmo.get_gizmo_pose_as_SE3_matrix(0), gizmo.get_gizmo_pose_as_SE3_matrix(1)];
+
+            // Run inverse kinematics
+            let output_poses = inverse_kinematics(states, constants);
+
+            // Apply the updated poses onto each link
+            for (let link_idx in output_poses) {
+                let output_pose = output_poses[link_idx];
+                robot.set_link_mesh_pose_from_SE3_matrix(engine, link_idx, output_pose);
+
+                // Draw gizmo on selected links
+                if (settings["link"+link_idx]) {
+                    draw_euler_axis(output_pose, 0.05, 0.002);  // length and width of line segments
+                }
+            }
+        },
         reset: function() {  // resets dofs only
             for (let key in settings) {
                 if (key.includes("dof")) {
@@ -252,6 +415,7 @@
     }
     // action folder
     let action_folder = gui.addFolder("Actions");
+    action_folder.add(actions, "solve_IK").name("Solve Inverse Kinematics");
     action_folder.add(actions, "reset").name("Reset");
     action_folder.add(actions, "select_all_frames").name("Select All Frames");
     action_folder.add(actions, "deselect_all_frames").name("Deselect All Frames");
@@ -265,32 +429,12 @@
     // this will spawn all of the robot's links at the origin
     robot.spawn_robot(engine);
 
+    // Add the control gizmos
+    let gizmo = new TransformGizmoEngine(engine);
+    gizmo.add_gizmo_SE3_matrix(engine, [[1,0,0, 0],[0,1,0, 0],[0,0,1, 2], [0, 0, 0, 1]]);  // 0: the ball gizmo
+    gizmo.add_gizmo_SE3_matrix(engine);  // 1: the core gizmo
+
     engine.animation_loop( ()  => {
-        // Grab states from settings
-        let states = new Array(num_dofs).fill(null)
-        for (let key in settings) {
-            if (key.includes("dof")) {
-                // Grab the dof index and values
-                let dof_idx = key.match(/\d+/);
-                dof_idx = dof_idx ? parseInt(dof_idx[0]) : null;
-                states[dof_idx] = settings[key];
-            }
-        }
-
-        // Run forward kinematics
-        let output_poses = forward_kinematics(states);
-
-        // Apply the updated poses onto each link
-        for (let link_idx in output_poses) {
-            let output_pose = output_poses[link_idx];
-            robot.set_link_mesh_pose_from_SE3_matrix(engine, link_idx, output_pose);
-
-            // Draw gizmo on selected links
-            if (settings["link"+link_idx]) {
-                draw_euler_axis(output_pose, 0.05, 0.002);  // length and width of line segments
-            }
-        }
-
         // Visibility settings
         robot.set_wireframe_visibility(engine, settings.display_wireframe);
         robot.set_mesh_visibility(engine, settings.display_mesh);
