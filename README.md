@@ -50,7 +50,7 @@ further solves stay on the right track. Unfortunately, I noticed that sometimes 
 weirdly in the wrong track, which I summarize to the problem of hitting a different local minimum instead
 of a global minimum. So I increased the number of iterations to 1000, and the result became much better.
 Just make sure to reset and try optimizing again if something seems weird continuously!  
-**I'm including a folder of screenshots of successful scenearios, "output examples," to showcase the functional output.**  
+**NOTE: I'm including a folder of screenshots of successful scenearios, "output examples," to showcase the functional output.**  
   
 Overall, it was a fun project, as I went through variety of optimization functions (some failed, some stayed) 
 and relentlessly pursued the tiny bits of adjustments (additional small constraints) needed here and there, 
