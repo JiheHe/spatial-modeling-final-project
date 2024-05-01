@@ -145,6 +145,33 @@
         engine.draw_debug_line(position, mapped_z, true, width, 0x2222ff);
     }
 
+    function generate_setting_states() {
+        // Grab states from settings
+        let states = new Array(num_dofs).fill(null)
+        for (let key in settings) {
+            if (key.includes("dof")) {
+                // Grab the dof index and values
+                let dof_idx = key.match(/\d+/);
+                dof_idx = dof_idx ? parseInt(dof_idx[0]) : null;
+                states[dof_idx] = settings[key];
+            }
+        }
+        return states;
+    }
+
+    function apply_output_poses(output_poses) {
+        // Apply the updated poses onto each link
+        for (let link_idx in output_poses) {
+            let output_pose = output_poses[link_idx];
+            robot.set_link_mesh_pose_from_SE3_matrix(engine, link_idx, output_pose);
+
+            // Draw gizmo on selected links
+            if (settings["link"+link_idx]) {
+                draw_euler_axis(output_pose, 0.05, 0.002);  // length and width of line segments
+            }
+        }
+    }
+
     function forward_kinematics(states) {  // states are stored in settings
         // Use forward kinematics to compute the output SE(3) poses from the given set of states
         // 1) Initialize an ordered set of identity elements for all links
@@ -250,12 +277,22 @@
         return add_matrix_matrix(proj_clamped(sub_matrix_matrix(p, a), sub_matrix_matrix(b, a)), a)
     }
 
+    function get_SO3_from_SE3(m) {
+        return [m[0].slice(0,3), m[1].slice(0,3), m[2].slice(0,3)];
+    }
+    function get_t3_from_SE3(m) {
+        return [[m[0][3]], [m[1][3]], [m[2][3]]];
+    }
+
     // States: an array where idx is dof_idx and value is value at that dof.
     function inverse_kinematics(states, constants) {
         // Process the constants
         let ball_gizmo_SE3 = constants[0];
         let trunk_gizmo_SE3 = constants[1];
         let gripper_init = [[1], [0], [0]];
+        let trunk_init = [[-1], [0], [0]];
+        let foot_init = [[0], [0], [1]];
+        let right_to_left_foot_init = [[0], [1], [0]];  // funny if z = 1
 
         // Define an objective function
         let f = states => {
@@ -263,34 +300,114 @@
             let output_poses = forward_kinematics(states);
 
             // Extract the needed info from output poses to construct constraint losses
+            let loss = 0;
+
             let trunk_SE3 = output_poses[1];  // Link 1
-            let L1 = disp_based_distance_SE3(trunk_SE3, trunk_gizmo_SE3);
+            // let L1 = disp_based_distance_SE3(trunk_SE3, trunk_gizmo_SE3);
+            let trunk_t3 = get_t3_from_SE3(trunk_SE3);
+            let trunk_gizmo_t3 = get_t3_from_SE3(trunk_gizmo_SE3);
+            let L1 = frobenius_norm_matrix(sub_matrix_matrix(trunk_t3, trunk_gizmo_t3));
+            loss += Math.pow(L1, 2);  // Need to square the loss for a smoother convergence
 
-            // let gripper_SE3 = output_poses[39];  // hard-coded for Link 30: gripper stater.
-            // let gripper_t3 = [gripper_SE3[0][3], gripper_SE3[1][3], gripper_SE3[2][3]];
-            // let gripper_SO3 = [gripper_SE3[0].slice(0,3), gripper_SE3[1].slice(0,3), gripper_SE3[2].slice(0,3)];
-            // let gripper_direction_vec = mul_matrix_matrix(gripper_SO3, gripper_init);
-            // let view_vector_end = add_matrix_matrix(gripper_t3, mul_matrix_scalar(gripper_direction_vec, 100));
-            // let ball_gizmo_t3 = [ball_gizmo_SE3[0][3], ball_gizmo_SE3[1][3], ball_gizmo_SE3[2][3]];
-            // let L2 = frobenius_norm_matrix(sub_matrix_matrix(
-            //     proj_onto_line_segment(gripper_t3, view_vector_end, ball_gizmo_t3), ball_gizmo_t3));
-            let L2 = 0;
+            let gripper_SE3 = output_poses[39];  // hard-coded for Link 39: gripper stater.
+            let gripper_t3 = get_t3_from_SE3(gripper_SE3);
+            let gripper_SO3 = get_SO3_from_SE3(gripper_SE3);
+            let gripper_direction_vec = mul_matrix_matrix(gripper_SO3, gripper_init);
+            let view_vector_end = add_matrix_matrix(gripper_t3, mul_matrix_scalar(gripper_direction_vec, 100));
+            let ball_gizmo_t3 = get_t3_from_SE3(ball_gizmo_SE3);
+            let L2 = frobenius_norm_matrix(sub_matrix_matrix(
+                proj_onto_line_segment(gripper_t3, view_vector_end, ball_gizmo_t3), ball_gizmo_t3));
+            loss += Math.pow(L2, 2);
 
-            return L1 + L2;  // return sum of losses
+            // let trunk_SO3 = get_SO3_from_SE3(trunk_SE3);
+            // let trunk_direction_vec = mul_matrix_matrix(trunk_SO3, trunk_init);
+            // let L3 = dot_product(trunk_direction_vec, [[0], [0], [1]]);  // ensures perpendicular to z
+            // L3 = Math.pow(L3, 2);
+            // loss += L3;
+
+            let trunk_SO3 = get_SO3_from_SE3(trunk_SE3);
+            let trunk_dir = mul_matrix_matrix(trunk_SO3, trunk_init);
+            let target_dir = mul_matrix_scalar(sub_matrix_matrix(ball_gizmo_t3, trunk_t3),
+                1 / frobenius_norm_matrix(sub_matrix_matrix(ball_gizmo_t3, trunk_t3)));
+            let L4 = dot_product(trunk_dir, target_dir) - 1;  // minimized at the maximization of dot (alignment)
+            loss += Math.pow(L4, 2);
+
+            let FR_foot_SE3 = output_poses[9];
+            let FR_foot_SO3 = get_SO3_from_SE3(FR_foot_SE3);
+            let FR_foot_dir = mul_matrix_matrix(FR_foot_SO3, foot_init);
+            let L5 = dot_product(FR_foot_dir, [[1], [0], [0]]);  // ensures perpendicular to x and y
+            loss += Math.pow(L5, 2);
+            L5 = dot_product(FR_foot_dir, [[0], [1], [0]]);
+            loss += Math.pow(L5, 2);
+
+            let FL_foot_SE3 = output_poses[16];
+            let FL_foot_SO3 = get_SO3_from_SE3(FL_foot_SE3);
+            let FL_foot_dir = mul_matrix_matrix(FL_foot_SO3, foot_init);
+            let L6 = dot_product(FL_foot_dir, [[1], [0], [0]]);  // ensures perpendicular to x and y
+            loss += Math.pow(L6, 2);
+            L6 = dot_product(FL_foot_dir, [[0], [1], [0]]);
+            loss += Math.pow(L6, 2);
+
+            let RR_foot_SE3 = output_poses[23];
+            let RR_foot_SO3 = get_SO3_from_SE3(RR_foot_SE3);
+            let RR_foot_dir = mul_matrix_matrix(RR_foot_SO3, foot_init);
+            let L7 = dot_product(RR_foot_dir, [[1], [0], [0]]);  // ensures perpendicular to x and y
+            loss += Math.pow(L7, 2);
+            L7 = dot_product(RR_foot_dir, [[0], [1], [0]]);
+            loss += Math.pow(L7, 2);
+
+            let RL_foot_SE3 = output_poses[30];
+            let RL_foot_SO3 = get_SO3_from_SE3(RL_foot_SE3);
+            let RL_foot_dir = mul_matrix_matrix(RL_foot_SO3, foot_init);
+            let L8 = dot_product(RL_foot_dir, [[1], [0], [0]]);  // ensures perpendicular to x and y
+            loss += Math.pow(L8, 2);
+            L8 = dot_product(RL_foot_dir, [[0], [1], [0]]);
+            loss += Math.pow(L8, 2);
+
+            // Right foot to left foot alignment (i.e. ensures each pair of R-L feet align as much as possible)
+            // i.e. minimizes body rotation as much as possible
+            let FR_foot_t3 = get_t3_from_SE3(FR_foot_SE3);
+            let FL_foot_t3 = get_t3_from_SE3(FL_foot_SE3);
+            let FRtL_foot_dir = mul_matrix_matrix(FR_foot_SO3, right_to_left_foot_init);
+            let FRtL_target_dir = mul_matrix_scalar(sub_matrix_matrix(FL_foot_t3, FR_foot_t3),
+                1 / frobenius_norm_matrix(sub_matrix_matrix(FL_foot_t3 , FR_foot_t3)));
+            let L9 = dot_product(FRtL_foot_dir, FRtL_target_dir) - 1;  // minimized at the maximization of dot (XY alignment)
+            loss += Math.pow(L9, 2);
+            L9 = FR_foot_t3[2][0] - FL_foot_t3[2][0];  // for Z alignment
+            loss += Math.pow(L9, 2);
+
+            let RR_foot_t3 = get_t3_from_SE3(RR_foot_SE3);
+            let RL_foot_t3 = get_t3_from_SE3(RL_foot_SE3);
+            let RRtL_foot_dir = mul_matrix_matrix(RR_foot_SO3, right_to_left_foot_init);
+            let RRtL_target_dir = mul_matrix_scalar(sub_matrix_matrix(RL_foot_t3, RR_foot_t3),
+                1 / frobenius_norm_matrix(sub_matrix_matrix(RL_foot_t3 , RR_foot_t3)));
+            let L10 = dot_product(RRtL_foot_dir, RRtL_target_dir) - 1;  // minimized at the maximization of dot (XY alignment)
+            loss += Math.pow(L10, 2);
+            L10 = RR_foot_t3[2][0] - RL_foot_t3[2][0];  // for Z alignment
+            loss += Math.pow(L10, 2);
+
+            // Heuristical soft constraint to raise arm higher.
+            let RR_thigh_SE3 = output_poses[19];
+            let RL_thigh_SE3 = output_poses[26];
+            // Same old "minus max threshold" trick works great! Drives the distance to be threshold apart.
+            let L11 = (gripper_SE3[2][3] - Math.max(RR_thigh_SE3[2][3], RL_thigh_SE3[2][3])) - 0.5;
+            loss += Math.pow(L11, 2);
+
+            return loss;  // return sum of losses
         }
         // Obtain a list of argmins (i.e. new dof values to achieve this IK)
         let initial_values = states;  // dof values
-        let num_iterations = undefined;  // defaults to 100
+        let num_iterations = 1000;  // defaults to 100
         let new_states = optimization_solve(f, initial_values, num_iterations, 'bfgs');
         // Update setting's DOFs based on these new values
         for (let dof_idx in new_states) {
-            settings["dof"+dof_idx] = new_states[dof_idx];
+            settings["dof" + dof_idx] = new_states[dof_idx];
             refresh_displays(gui);
         }
-        // Run FK based these new dof values from IK
-        let new_output_poses = forward_kinematics(new_states);
-        // Return the new output poses
-        return new_output_poses;
+        // // Run FK based these new dof values from IK
+        // let new_output_poses = forward_kinematics(new_states);
+        // // Return the new output poses
+        // return new_output_poses;
     }
 
     let engine = ThreeEngine.new_default_3d();
@@ -346,33 +463,19 @@
 
     let actions = {
         solve_IK: function() {
-            // Grab states from settings
-            let states = new Array(num_dofs).fill(null)
-            for (let key in settings) {
-                if (key.includes("dof")) {
-                    // Grab the dof index and values
-                    let dof_idx = key.match(/\d+/);
-                    dof_idx = dof_idx ? parseInt(dof_idx[0]) : null;
-                    states[dof_idx] = settings[key];
-                }
-            }
+            // Grab states
+            let states = generate_setting_states();
 
             // Grab constant values from constraints
             let constants = [gizmo.get_gizmo_pose_as_SE3_matrix(0), gizmo.get_gizmo_pose_as_SE3_matrix(1)];
 
             // Run inverse kinematics
-            let output_poses = inverse_kinematics(states, constants);
-
-            // Apply the updated poses onto each link
-            for (let link_idx in output_poses) {
-                let output_pose = output_poses[link_idx];
-                robot.set_link_mesh_pose_from_SE3_matrix(engine, link_idx, output_pose);
-
-                // Draw gizmo on selected links
-                if (settings["link"+link_idx]) {
-                    draw_euler_axis(output_pose, 0.05, 0.002);  // length and width of line segments
-                }
-            }
+            inverse_kinematics(states, constants);
+            // let output_poses = inverse_kinematics(states, constants);
+            //
+            // // Apply the updated poses onto each link
+            // apply_output_poses(output_poses);
+            global_states = generate_setting_states();
         },
         reset: function() {  // resets dofs only
             for (let key in settings) {
@@ -381,6 +484,9 @@
                 }
             }
             refresh_displays(gui);
+            // Reset visual
+            global_states = generate_setting_states();
+            // apply_output_poses(forward_kinematics(generate_setting_states()));
         },
         select_all_frames: function() {  // selects all links
             for (let key in settings) {
@@ -411,7 +517,7 @@
     for (const dof_idx of sortedKeys) {  // 'of' is foreach, 'in' is indexing
         // Add based on range of values for the DoF
         let range = dof_to_range[dof_idx];
-        dof_folder.add(settings, "dof"+dof_idx, range[0], range[1]).name("dof"+dof_idx);
+        dof_folder.add(settings, "dof"+dof_idx, range[0], range[1]).name("dof"+dof_idx).disable();
     }
     // action folder
     let action_folder = gui.addFolder("Actions");
@@ -428,13 +534,25 @@
 
     // this will spawn all of the robot's links at the origin
     robot.spawn_robot(engine);
+    // Visualization
+    // apply_output_poses(forward_kinematics(generate_setting_states()));
 
     // Add the control gizmos
     let gizmo = new TransformGizmoEngine(engine);
     gizmo.add_gizmo_SE3_matrix(engine, [[1,0,0, 0],[0,1,0, 0],[0,0,1, 2], [0, 0, 0, 1]]);  // 0: the ball gizmo
     gizmo.add_gizmo_SE3_matrix(engine);  // 1: the core gizmo
 
+    let global_states = generate_setting_states();  // the global variable
+
     engine.animation_loop( ()  => {
+        let ball_SE3 = gizmo.get_gizmo_pose_as_SE3_matrix(0);
+        engine.draw_debug_sphere([ball_SE3[0][3], ball_SE3[1][3], ball_SE3[2][3]],
+            0.2,
+            0xf88158);  // basketball-orange
+
+        // Always update poses
+        apply_output_poses(forward_kinematics(global_states));
+
         // Visibility settings
         robot.set_wireframe_visibility(engine, settings.display_wireframe);
         robot.set_mesh_visibility(engine, settings.display_mesh);
